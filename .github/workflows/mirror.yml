@@ -1,0 +1,44 @@
+name: Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Bot Alive (Default 2 Hours)"
+        required: true
+        default: "2"
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install aria2
+        run: |
+          sudo apt update && sudo apt install aria2 -y
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start Telegram Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          PIXEL_TOKEN: ${{ secrets.PIXEL_TOKEN }}
+        run: |
+          HOURS=${{ github.event.inputs.hours }}
+
+          timeout ${HOURS}h python bot.py
+
+          echo "Bot session timeout"
