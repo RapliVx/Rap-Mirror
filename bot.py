@@ -5,16 +5,34 @@ import requests
 import psutil
 import shutil
 import time
+import logging
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
+# ------------------------
+# Configuration & Globals
+# ------------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+
 task_queue = asyncio.Queue()
 current_task = None
 current_file = None
+current_process = None          # for cancellation
+current_chat = None              # chat id of current download
+
+# Simple URL cache for callback data
+url_cache = {}
+CACHE_EXPIRY = 300  # seconds
+
+# Logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ------------------------
 # System info
@@ -60,7 +78,7 @@ def build_sf_mirror(url, mirror):
     return url
 
 # ------------------------
-# GoFile uploader
+# GoFile uploader (unchanged)
 # ------------------------
 def upload_gofile(file):
     with open(file, "rb") as f:
@@ -71,10 +89,10 @@ def upload_gofile(file):
         return None
 
 # ------------------------
-# Download using aria2c
+# Download using aria2c (with process tracking)
 # ------------------------
 async def download_file(msg, url, filename):
-    global current_file
+    global current_process
     cmd = [
         "aria2c",
         "-x", "16",
@@ -89,6 +107,7 @@ async def download_file(msg, url, filename):
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    current_process = process   # store for cancellation
 
     last_update = time.time()
     while True:
@@ -105,12 +124,13 @@ async def download_file(msg, url, filename):
     code = process.wait()
     if code != 0 or not os.path.exists(filename):
         raise Exception("Download failed")
+    current_process = None      # clear after successful download
 
 # ------------------------
 # Worker
 # ------------------------
 async def worker(app):
-    global current_task, current_file
+    global current_task, current_file, current_process, current_chat
     while True:
         task = await task_queue.get()
         chat = task["chat"]
@@ -125,6 +145,7 @@ async def worker(app):
 
         current_file = filename
         current_task = "Downloading"
+        current_chat = chat
         msg = await app.bot.send_message(chat, f"📥 Starting download\n`{filename}`", parse_mode="Markdown")
 
         try:
@@ -151,6 +172,8 @@ async def worker(app):
                 os.remove(filename)
             current_task = None
             current_file = None
+            current_process = None
+            current_chat = None
 
 # ------------------------
 # Commands
@@ -188,6 +211,16 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage:\n/mirror <link>")
         return
 
+    # Generate a unique cache ID and store URL
+    cache_id = str(int(time.time()))
+    url_cache[cache_id] = (url, time.time())
+
+    # Clean expired cache entries occasionally
+    now = time.time()
+    expired = [cid for cid, (_, ts) in url_cache.items() if now - ts > CACHE_EXPIRY]
+    for cid in expired:
+        del url_cache[cid]
+
     if "sourceforge.net/projects" in url:
         mirrors = get_sf_mirrors(url)
         if not mirrors:
@@ -199,7 +232,6 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Multiple mirrors → show buttons
-        cache_id = str(int(time.time()))
         buttons = []
         row = []
         for i, m in enumerate(mirrors, 1):
@@ -217,10 +249,10 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     else:
         # Direct link or others
-        cache_id = str(int(time.time()))
         buttons = [[
             InlineKeyboardButton("🌐 Mirror", callback_data=f"link|{cache_id}"),
-            InlineKeyboardButton("⏭ Skip", callback_data="skip")
+            InlineKeyboardButton("⏭ Skip", callback_data="skip"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{cache_id}")
         ]]
         await update.message.reply_text(
             "👋 *Hi! I’m Mahiro BOT*\nI detected a file link, choose an option below.",
@@ -232,39 +264,72 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Callback query handler
 # ------------------------
 async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_process, current_task, current_file, current_chat
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data.startswith("sf|"):
         _, cache_id, mirror = data.split("|")
-        message = query.message
+        # Retrieve original URL from cache
+        url_info = url_cache.get(cache_id)
+        if not url_info:
+            await query.edit_message_text("⏰ This link has expired. Please send again.")
+            return
+        url, _ = url_info
         await query.message.edit_text(f"🌐 Mirror selected: {mirror}")
-        url = ""  # You can store original URL in cache if needed
         await task_queue.put({"chat": query.message.chat_id, "url": url, "mirror": mirror})
+        # Optionally remove from cache
+        del url_cache[cache_id]
+
     elif data.startswith("link|"):
-        message = query.message
+        _, cache_id = data.split("|")
+        url_info = url_cache.get(cache_id)
+        if not url_info:
+            await query.edit_message_text("⏰ This link has expired. Please send again.")
+            return
+        url, _ = url_info
         await query.message.edit_text("🌐 Starting mirror...")
-        url = ""  # Store or get link from cache
         await task_queue.put({"chat": query.message.chat_id, "url": url})
+        del url_cache[cache_id]
+
+    elif data.startswith("cancel|"):
+        _, cache_id = data.split("|")
+        chat_id = query.message.chat_id
+        # Check if there is an active download from this chat
+        if current_chat == chat_id and current_process:
+            current_process.terminate()
+            current_process = None
+            current_task = None
+            current_file = None
+            current_chat = None
+            await query.edit_message_text("❌ Current download cancelled.")
+        else:
+            await query.edit_message_text("No active download from this chat to cancel.")
+
     elif data == "skip":
-        await query.message.edit_text("⏭ Skipped.")
+        await query.edit_message_text("⏭ Skipped.")
 
 # ------------------------
 # Main
 # ------------------------
 def main():
+    # Check for aria2c availability
+    if not shutil.which("aria2c"):
+        logger.error("aria2c not found in PATH. Please install aria2.")
+        return
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler(["mirror", "m"], mirror))
-    app.add_handler(CallbackQueryHandler(mirror_select, pattern="^(sf\||link\||skip)"))
+    app.add_handler(CallbackQueryHandler(mirror_select, pattern="^(sf\||link\||cancel|skip)"))
 
     async def start_worker(app):
         asyncio.create_task(worker(app))
 
     app.post_init = start_worker
-    print("BOT STARTED")
+    logger.info("BOT STARTED")
     app.run_polling()
 
 if __name__ == "__main__":
