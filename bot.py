@@ -10,7 +10,7 @@ from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # ------------------------
 # Configuration & Globals
@@ -22,6 +22,7 @@ current_task = None
 current_file = None
 current_process = None          # for cancellation
 current_chat = None              # chat id of current download
+cancel_requested = False         # flag for upload cancellation
 
 # Simple URL cache for callback data
 url_cache = {}
@@ -107,7 +108,12 @@ async def download_file(msg, url, filename):
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
-    current_process = process   # store for cancellation
+    current_process = process
+
+    # Cancel button for download phase
+    cancel_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Download", callback_data="cancel_download")
+    ]])
 
     last_update = time.time()
     while True:
@@ -117,20 +123,24 @@ async def download_file(msg, url, filename):
         if "%" in line and time.time() - last_update > 2:
             last_update = time.time()
             try:
-                await msg.edit_text(f"📥 Downloading\n`{filename}`\n\n{line.strip()}", parse_mode="Markdown")
+                await msg.edit_text(
+                    f"📥 Downloading\n`{filename}`\n\n{line.strip()}",
+                    parse_mode="Markdown",
+                    reply_markup=cancel_keyboard
+                )
             except:
                 pass
 
     code = process.wait()
     if code != 0 or not os.path.exists(filename):
         raise Exception("Download failed")
-    current_process = None      # clear after successful download
+    current_process = None
 
 # ------------------------
 # Worker
 # ------------------------
 async def worker(app):
-    global current_task, current_file, current_process, current_chat
+    global current_task, current_file, current_process, current_chat, cancel_requested
     while True:
         task = await task_queue.get()
         chat = task["chat"]
@@ -146,6 +156,7 @@ async def worker(app):
         current_file = filename
         current_task = "Downloading"
         current_chat = chat
+        cancel_requested = False
         msg = await app.bot.send_message(chat, f"📥 Starting download\n`{filename}`", parse_mode="Markdown")
 
         try:
@@ -155,11 +166,25 @@ async def worker(app):
                 url = resolve_direct(url)
             await download_file(msg, url, filename)
 
-            current_task = "Uploading"
-            await msg.edit_text("📤 Uploading...")
-            link = upload_gofile(filename)
+            # If download was cancelled, skip upload
+            if cancel_requested:
+                await msg.edit_text("❌ Operation cancelled.")
+                continue
 
-            if link:
+            current_task = "Uploading"
+            # Upload phase with cancel button
+            upload_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")
+            ]])
+            await msg.edit_text("📤 Uploading... (click Cancel to discard)", reply_markup=upload_keyboard)
+
+            # Run upload in a thread to keep bot responsive
+            loop = asyncio.get_event_loop()
+            link = await loop.run_in_executor(None, upload_gofile, filename)
+
+            if cancel_requested:
+                await msg.edit_text("❌ Upload cancelled by user.")
+            elif link:
                 await msg.edit_text(f"✅ Mirror Complete\n{link}")
             else:
                 await msg.edit_text("❌ Upload failed")
@@ -174,6 +199,7 @@ async def worker(app):
             current_file = None
             current_process = None
             current_chat = None
+            cancel_requested = False
 
 # ------------------------
 # Commands
@@ -264,14 +290,13 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Callback query handler
 # ------------------------
 async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_process, current_task, current_file, current_chat
+    global current_process, current_task, current_file, current_chat, cancel_requested
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data.startswith("sf|"):
         _, cache_id, mirror = data.split("|")
-        # Retrieve original URL from cache
         url_info = url_cache.get(cache_id)
         if not url_info:
             await query.edit_message_text("⏰ This link has expired. Please send again.")
@@ -279,7 +304,6 @@ async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url, _ = url_info
         await query.message.edit_text(f"🌐 Mirror selected: {mirror}")
         await task_queue.put({"chat": query.message.chat_id, "url": url, "mirror": mirror})
-        # Optionally remove from cache
         del url_cache[cache_id]
 
     elif data.startswith("link|"):
@@ -293,10 +317,29 @@ async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await task_queue.put({"chat": query.message.chat_id, "url": url})
         del url_cache[cache_id]
 
+    elif data == "cancel_download":
+        chat_id = query.message.chat_id
+        if current_chat == chat_id and current_process:
+            current_process.terminate()
+            current_process = None
+            current_task = None
+            current_file = None
+            current_chat = None
+            await query.edit_message_text("❌ Download cancelled.")
+        else:
+            await query.edit_message_text("No active download to cancel.")
+
+    elif data == "cancel_upload":
+        chat_id = query.message.chat_id
+        if current_chat == chat_id:
+            cancel_requested = True
+            await query.edit_message_text("❌ Upload will be cancelled after current transfer.")
+        else:
+            await query.edit_message_text("No active upload to cancel.")
+
     elif data.startswith("cancel|"):
         _, cache_id = data.split("|")
         chat_id = query.message.chat_id
-        # Check if there is an active download from this chat
         if current_chat == chat_id and current_process:
             current_process.terminate()
             current_process = None
@@ -323,7 +366,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler(["mirror", "m"], mirror))
-    app.add_handler(CallbackQueryHandler(mirror_select, pattern="^(sf\||link\||cancel|skip)"))
+    app.add_handler(CallbackQueryHandler(mirror_select, pattern="^(sf\||link\||cancel_download|cancel_upload|cancel|skip)"))
 
     async def start_worker(app):
         asyncio.create_task(worker(app))
