@@ -7,7 +7,7 @@ import shutil
 import time
 import logging
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs # Ditambahkan parse_qs untuk Google Drive
 from bs4 import BeautifulSoup
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -50,7 +50,7 @@ def get_system_info():
     }
 
 # ------------------------
-# Helper: Progress Bar UI
+# Helper: Progress Bar UI & Filename Fetcher
 # ------------------------
 def create_progress_bar(percentage, length=10):
     filled = int((percentage / 100) * length)
@@ -66,6 +66,30 @@ def parse_aria2_line(line):
         eta = eta if eta else "0s"
         return downloaded, total, int(pct), speed, eta
     return None
+
+# Fungsi baru untuk mendapatkan nama asli dari GDrive atau Direct Link
+def get_real_filename(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        with requests.get(url, stream=True, allow_redirects=True, headers=headers, timeout=10) as r:
+            if "Content-Disposition" in r.headers:
+                cd = r.headers["Content-Disposition"]
+                match = re.search(r'filename\*?=(?:UTF-\d\'\')?["\']?([^;"\'\r\n]+)', cd, re.IGNORECASE)
+                if match:
+                    return unquote(match.group(1))
+    except Exception as e:
+        logger.error(f"Failed to fetch header filename: {e}")
+    
+    parsed = urlparse(url)
+    name = unquote(os.path.basename(parsed.path))
+    
+    if not name or name in ["download", "uc"]:
+        query_id = parse_qs(parsed.query).get('id')
+        if query_id:
+            return f"gdrive_{query_id[0]}" 
+        return f"file_{int(time.time())}"
+    
+    return name
 
 # ------------------------
 # URL & SourceForge Handlers
@@ -142,10 +166,11 @@ async def download_file(msg, url, filename):
             downloaded, total, pct, speed, eta = parsed
             bar = create_progress_bar(pct)
             
+            # --- TAMPILAN DIRAPIKAN DISINI DENGAN EXTRA GAP ---
             text = (
                 f"📥 *Downloading File*\n"
                 f"📄 `{filename}`\n\n"
-                f"[{bar}] *{pct}%*\n"
+                f"📊 *Progress:* [{bar}] *{pct}%*\n\n"
                 f"💾 *Size:* {downloaded} / {total}\n"
                 f"🚀 *Speed:* {speed}\n"
                 f"⏱ *ETA:* {eta}"
@@ -171,21 +196,23 @@ async def worker(app):
         url = task["url"]
         mirror = task.get("mirror")
 
-        parsed = urlparse(url)
-        filename = unquote(os.path.basename(parsed.path))
-        if not filename or filename == "download":
-            parts = parsed.path.split("/")
-            filename = parts[-2] if len(parts) > 2 else f"file_{int(time.time())}"
-
-        current_file = filename
         current_task = "Downloading"
         current_chat = chat
         cancel_requested = False
         
-        msg = await app.bot.send_message(chat, f"⏳ *Preparing Download...*\n📄 `{filename}`", parse_mode="Markdown")
-
         try:
+            # Selesaikan URL (termasuk resolve mirror SourceForge atau direct link)
             target_url = build_sf_mirror(url, mirror) if mirror else resolve_direct(url)
+            
+            # Ambil nama file secara akurat
+            filename = get_real_filename(target_url)
+            # Bersihkan karakter aneh pada nama file
+            filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+            
+            current_file = filename
+            
+            msg = await app.bot.send_message(chat, f"⏳ *Preparing Download...*\n📄 `{filename}`", parse_mode="Markdown")
+
             await download_file(msg, target_url, filename)
 
             if cancel_requested:
@@ -220,11 +247,11 @@ async def worker(app):
                 await msg.edit_text(f"❌ *Error Occurred:*\n`{e}`", parse_mode="Markdown")
 
         finally:
-            if os.path.exists(filename):
+            if current_file and os.path.exists(current_file):
                 try:
-                    os.remove(filename)
+                    os.remove(current_file)
                 except Exception as e:
-                    logger.error(f"Failed to delete {filename}: {e}")
+                    logger.error(f"Failed to delete {current_file}: {e}")
             
             current_task = None
             current_file = None
@@ -293,15 +320,13 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🌐 *Mirror Auto-Selected:* `{mirrors[0]}`", parse_mode="Markdown")
             return
 
-        # Store mirrors list in cache to avoid 64-byte callback limit
         url_cache[cache_id] = {'url': url, 'ts': time.time(), 'mirrors': mirrors}
         
         buttons = []
         row = []
         for i, m in enumerate(mirrors):
-            # Send index instead of full name
             row.append(InlineKeyboardButton(m[:10], callback_data=f"sf|{cache_id}|{i}"))
-            if len(row) == 4: # Max 4 buttons per row for better mobile UI
+            if len(row) == 4:
                 buttons.append(row)
                 row = []
         if row:
@@ -366,7 +391,6 @@ async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         if current_chat == chat_id and current_process:
             current_process.terminate()
-            # Cleanup is handled in the `finally` block of the worker function
         else:
             await query.edit_message_text("⚠️ *No active download to cancel.*", parse_mode="Markdown")
 
