@@ -115,6 +115,13 @@ def build_sf_mirror(url, mirror):
 # ------------------------
 def download_gdrive_sync(url):
     """Synchronous gdown function to run in executor"""
+    # Otomatis inject cookies.txt ke folder cache gdown jika file tersebut tersedia
+    if os.path.exists("cookies.txt"):
+        gdown_cache = os.path.expanduser("~/.cache/gdown")
+        os.makedirs(gdown_cache, exist_ok=True)
+        shutil.copy("cookies.txt", os.path.join(gdown_cache, "cookies.txt"))
+        logger.info("Cookies injected to gdown cache directory.")
+
     # output=None allows gdown to automatically fetch the correct filename
     return gdown.download(url=url, output=None, fuzzy=True, quiet=False)
 
