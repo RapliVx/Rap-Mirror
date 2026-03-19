@@ -7,7 +7,7 @@ import shutil
 import time
 import logging
 import re
-from urllib.parse import urlparse, unquote, parse_qs # Ditambahkan parse_qs untuk Google Drive
+from urllib.parse import urlparse, unquote, parse_qs
 from bs4 import BeautifulSoup
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -67,7 +67,7 @@ def parse_aria2_line(line):
         return downloaded, total, int(pct), speed, eta
     return None
 
-# Fungsi baru untuk mendapatkan nama asli dari GDrive atau Direct Link
+# Ditambahkan penanganan GDrive Bypass untuk nama file
 def get_real_filename(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -77,6 +77,14 @@ def get_real_filename(url):
                 match = re.search(r'filename\*?=(?:UTF-\d\'\')?["\']?([^;"\'\r\n]+)', cd, re.IGNORECASE)
                 if match:
                     return unquote(match.group(1))
+            
+            # Fallback untuk membaca nama dari halaman warning Google Drive
+            if "drive.google" in url or "drive.usercontent" in url:
+                chunk = next(r.iter_content(chunk_size=10240), b"").decode("utf-8", errors="ignore")
+                soup = BeautifulSoup(chunk, "html.parser")
+                name_tag = soup.select_one(".uc-name-size a")
+                if name_tag:
+                    return name_tag.text.strip()
     except Exception as e:
         logger.error(f"Failed to fetch header filename: {e}")
     
@@ -94,11 +102,31 @@ def get_real_filename(url):
 # ------------------------
 # URL & SourceForge Handlers
 # ------------------------
+# Ditambahkan Bypass GDrive
 def resolve_direct(url):
     try:
-        r = requests.head(url, allow_redirects=True, timeout=10)
-        return r.url
-    except requests.RequestException:
+        if "drive.google.com" in url or "drive.usercontent.google.com" in url:
+            r = requests.get(url, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            form = soup.find("form", id="download-form")
+            if form:
+                params = {inp.get("name"): inp.get("value") for inp in form.find_all("input", type="hidden")}
+                action_url = form.get("action")
+                if action_url and not action_url.startswith("http"):
+                    parsed = urlparse(url)
+                    action_url = f"{parsed.scheme}://{parsed.netloc}{action_url}"
+                elif not action_url:
+                    action_url = url
+                    
+                req = requests.Request('GET', action_url, params=params)
+                return req.prepare().url
+            return r.url
+        else:
+            r = requests.head(url, allow_redirects=True, timeout=10)
+            return r.url
+    except Exception as e:
+        logger.error(f"Error resolving direct link: {e}")
         return url
 
 def get_sf_mirrors(url):
@@ -166,7 +194,6 @@ async def download_file(msg, url, filename):
             downloaded, total, pct, speed, eta = parsed
             bar = create_progress_bar(pct)
             
-            # --- TAMPILAN DIRAPIKAN DISINI DENGAN EXTRA GAP ---
             text = (
                 f"📥 *Downloading File*\n"
                 f"📄 `{filename}`\n\n"
@@ -201,12 +228,9 @@ async def worker(app):
         cancel_requested = False
         
         try:
-            # Selesaikan URL (termasuk resolve mirror SourceForge atau direct link)
             target_url = build_sf_mirror(url, mirror) if mirror else resolve_direct(url)
             
-            # Ambil nama file secara akurat
             filename = get_real_filename(target_url)
-            # Bersihkan karakter aneh pada nama file
             filename = re.sub(r'[\\/*?:"<>|]', "", filename)
             
             current_file = filename
